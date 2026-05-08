@@ -14,6 +14,7 @@ import streamlit as st
 from engine import (
     extract_pattern,
     extract_price_curve,
+    extract_candlestick,
     extract_timestamps,
     interpolate_time,
     search_chart,
@@ -25,6 +26,8 @@ from engine import (
     SignalMode,
     FuzzParams,
     fuzz_preset,
+    CandleColors,
+    TRADINGVIEW_COLORS,
 )
 
 # ─────────────────────────────────────────────────────────────────────
@@ -97,45 +100,45 @@ with st.sidebar:
     st.subheader("Signal mode")
     st.caption(
         "Choose which signals to extract and match. "
-        "HLC uses both mid-price shape **and** the high-low spread width, "
-        "giving a richer fingerprint at the cost of requiring both images "
-        "to be HLC charts."
+        "Both images must use the same chart type to unlock richer matching."
     )
+
+    CHART_TYPES = ["Single line (mid only)", "HLC (mid + spread)", "Candlestick (green/red)"]
 
     ref_signal_label = st.radio(
-        "Reference chart type",
-        options=["Single line (mid only)", "HLC (mid + spread)"],
-        index=0,
-        key="ref_sig",
+        "Reference chart type", CHART_TYPES, index=0, key="ref_sig",
         help="What type of chart is your reference image?"
     )
-    ref_signal = SignalMode.HLC if "HLC" in ref_signal_label else SignalMode.MID_ONLY
-
     cand_signal_label = st.radio(
-        "Candidate chart type",
-        options=["Single line (mid only)", "HLC (mid + spread)"],
-        index=0,
-        key="cand_sig",
+        "Candidate chart type", CHART_TYPES, index=0, key="cand_sig",
         help="What type of charts are your candidate images?"
     )
-    cand_signal = SignalMode.HLC if "HLC" in cand_signal_label else SignalMode.MID_ONLY
 
-    # Determine the actual matching mode
-    if ref_signal == SignalMode.HLC and cand_signal == SignalMode.HLC:
-        match_signal = SignalMode.HLC
+    def _label_to_signal(label):
+        if "Candlestick" in label: return SignalMode.CANDLE
+        if "HLC"         in label: return SignalMode.HLC
+        return SignalMode.MID_ONLY
+
+    ref_signal  = _label_to_signal(ref_signal_label)
+    cand_signal = _label_to_signal(cand_signal_label)
+
+    if ref_signal == cand_signal == SignalMode.CANDLE:
+        match_signal  = SignalMode.CANDLE
+        signal_status = "🕯️ Candlestick matching (wick mid + body mid + body spread)"
+    elif ref_signal == cand_signal == SignalMode.HLC:
+        match_signal  = SignalMode.HLC
         signal_status = "🟡 HLC matching (mid + spread)"
     else:
-        match_signal = SignalMode.MID_ONLY
+        match_signal  = SignalMode.MID_ONLY
         if ref_signal != cand_signal:
-            signal_status = "🔵 Mid-only matching (chart types differ)"
+            signal_status = "🔵 Mid-only matching (chart types differ — using wick mid only)"
         else:
             signal_status = "🔵 Mid-only matching"
     st.info(signal_status)
 
     if match_signal == SignalMode.HLC:
         spread_weight = st.slider(
-            "Spread weight in HLC matching",
-            0.10, 0.60, 0.35, 0.05,
+            "Spread weight in HLC matching", 0.10, 0.60, 0.35, 0.05,
             help="How much the H-L spread signal contributes vs mid-price shape",
         )
     else:
@@ -231,7 +234,10 @@ with col_ref:
     st.subheader("① Reference pattern")
 
     if ref_mode == ReferenceMode.PLAIN_CHART:
-        if ref_signal == SignalMode.HLC:
+        if ref_signal == SignalMode.CANDLE:
+            st.caption("Upload a **candlestick chart** (TradingView default colours). Wick + body signals will be extracted.")
+            mode_hint = "🕯️ Candlestick chart"
+        elif ref_signal == SignalMode.HLC:
             st.caption("Upload a clean **HLC line chart**. Mid-price + H-L spread will be extracted.")
             mode_hint = "🟡 HLC plain chart"
         else:
@@ -287,6 +293,7 @@ with col_ref:
                 mode=ref_mode,
                 signal_mode=ref_signal,
                 brightness_threshold=brightness_thresh,
+                candle_colors=TRADINGVIEW_COLORS,
                 crop=crop,
             )
 
@@ -401,7 +408,10 @@ if st.button(
         img_bgr = image_from_bytes(f.read())
         prog.progress(i / len(cand_files), text=f"Searching {f.name}…")
 
-        signals = extract_price_curve(img_bgr, brightness_threshold=brightness_thresh)
+        if cand_signal == SignalMode.CANDLE:
+            signals = extract_candlestick(img_bgr)
+        else:
+            signals = extract_price_curve(img_bgr, brightness_threshold=brightness_thresh)
         if signals is None:
             continue
 

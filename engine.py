@@ -44,27 +44,64 @@ class MatchResult:
 class ChartSignals:
     """
     Raw pixel-space signals extracted from a chart image.
-    mid    : (H+L)/2 per column — price direction/shape
-    spread : L-H per column    — volatility / H-L band width (always >= 0)
-    Both are smoothed but NOT globally normalised — normalisation happens
-    per-window inside search_chart so local amplitude is preserved.
+
+    All arrays are smoothed but NOT globally normalised — normalisation
+    happens per-window inside search_chart so local amplitude is preserved.
+
+    Line / HLC chart:
+      mid    : (H+L)/2 per column — price direction / shape
+      spread : L-H per column     — H-L band width (volatility proxy)
+
+    Candlestick chart (all of the above, plus):
+      body_mid    : (body_top + body_bot) / 2 — open/close midpoint
+      body_spread : body_bot - body_top        — body height (conviction)
+      direction   : +1 bull (close > open), -1 bear, 0 doji/unknown
     """
-    mid:    np.ndarray
-    spread: np.ndarray
+    mid:          np.ndarray
+    spread:       np.ndarray
+    body_mid:     np.ndarray | None = None
+    body_spread:  np.ndarray | None = None
+    direction:    np.ndarray | None = None   # float array: +1 / -1 / 0
 
     @property
     def length(self) -> int:
         return len(self.mid)
 
+    @property
+    def has_candle_signals(self) -> bool:
+        return self.body_mid is not None
+
+
+@dataclass
+class CandleColors:
+    """
+    HSV colour ranges for candlestick body detection.
+    Defaults match TradingView dark theme (green/red candles, white wicks).
+    Override for other platforms or themes.
+    """
+    bull_lower: tuple = (45, 80, 60)    # green bodies
+    bull_upper: tuple = (85, 255, 255)
+    bear_lower1: tuple = (0,  150, 80)  # red bodies (hue wraps at 180)
+    bear_upper1: tuple = (15, 255, 255)
+    bear_lower2: tuple = (155, 150, 80)
+    bear_upper2: tuple = (180, 255, 255)
+    wick_lower: tuple = (0, 0, 180)     # white/grey wicks
+    wick_upper: tuple = (180, 20, 255)
+
+
+# Singleton default — import and use directly, or override per-call
+TRADINGVIEW_COLORS = CandleColors()
+
 
 class SignalMode:
-    MID_ONLY = "mid"   # match mid curve only — works for single-line or HLC charts
-    HLC      = "hlc"   # match mid + spread — requires HLC chart for both images
+    MID_ONLY = "mid"     # match wick mid curve only — works for any chart type
+    HLC      = "hlc"     # match wick mid + wick spread — HLC / line charts
+    CANDLE   = "candle"  # match wick mid + body mid + body spread + direction
 
 
 class ReferenceMode:
     DRAWN_LINE  = "drawn"   # image has a coloured markup line drawn on it
-    PLAIN_CHART = "plain"   # image is a clean line chart — no markup
+    PLAIN_CHART = "plain"   # image is a clean line/HLC/candle chart — no markup
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -122,6 +159,7 @@ def extract_pattern(
     mode: str = ReferenceMode.PLAIN_CHART,
     signal_mode: str = SignalMode.MID_ONLY,
     brightness_threshold: int = 150,
+    candle_colors: CandleColors | None = None,
     crop: tuple[int, int, int, int] | None = None,
 ) -> ChartSignals | None:
     """
@@ -129,26 +167,35 @@ def extract_pattern(
 
     mode=DRAWN_LINE : detects a coloured (blue/red) markup overlay
     mode=PLAIN_CHART: treats the image itself as the pattern
-    signal_mode     : MID_ONLY or HLC (mid + spread)
-    crop            : optional pixel crop applied before extraction
+    signal_mode     : MID_ONLY | HLC | CANDLE
+    candle_colors   : override default TradingView colours (CANDLE mode only)
+    crop            : optional pixel crop (x0, y0, x1, y1) applied first
 
-    Returns a ChartSignals with mid (and optionally spread) normalised to [0,1].
+    Returns a ChartSignals with signals normalised to [0,1].
     """
     if crop is not None:
         x0, y0, x1, y1 = crop
         img_bgr = img_bgr[y0:y1, x0:x1]
 
     if mode == ReferenceMode.DRAWN_LINE:
-        # Drawn-line mode only gives a single mid curve
         raw_mid = extract_drawn_line(img_bgr)
         if raw_mid is None:
             return None
-        # raw_mid is already normalised [0,1] by extract_drawn_line
-        spread = np.zeros_like(raw_mid)
-        return ChartSignals(mid=raw_mid, spread=spread)
+        return ChartSignals(mid=raw_mid, spread=np.zeros_like(raw_mid))
+
+    elif signal_mode == SignalMode.CANDLE:
+        signals = extract_candlestick(
+            img_bgr,
+            colors=candle_colors,
+            top_crop_pct=0.0,
+            bottom_crop_pct=0.0,
+            right_crop_pct=0.0,
+        )
+        if signals is None:
+            return None
+        return _normalise_signals(signals, signal_mode)
 
     else:
-        # Plain chart mode: run full extraction with no axis crops
         signals = extract_price_curve(
             img_bgr,
             top_crop_pct=0.0,
@@ -158,22 +205,7 @@ def extract_pattern(
         )
         if signals is None:
             return None
-
-        # Normalise mid to [0,1] with Y-flip (reference is self-contained)
-        mid_n = _norm_flip(signals.mid)
-        if mid_n is None:
-            return None
-
-        if signal_mode == SignalMode.HLC:
-            # Normalise spread to [0,1] (no flip needed — spread is already ≥ 0,
-            # larger spread = wider band, no directional meaning)
-            sp = signals.spread.copy()
-            sp_range = sp.max() - sp.min()
-            spread_n = (sp - sp.min()) / sp_range if sp_range > 1e-6 else np.zeros_like(sp)
-        else:
-            spread_n = np.zeros_like(mid_n)
-
-        return ChartSignals(mid=mid_n, spread=spread_n)
+        return _normalise_signals(signals, signal_mode)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -237,9 +269,116 @@ def extract_price_curve(
     return ChartSignals(mid=mid_y, spread=spread_y)
 
 
-# ─────────────────────────────────────────────────────────────────────
-#  OCR — timestamp extraction from chart bottom axis
-# ─────────────────────────────────────────────────────────────────────
+def extract_candlestick(
+    img_bgr: np.ndarray,
+    colors: CandleColors | None = None,
+    top_crop_pct: float = 0.04,
+    bottom_crop_pct: float = 0.08,
+    right_crop_pct: float = 0.09,
+) -> ChartSignals | None:
+    """
+    Extract price signals from a TradingView-style candlestick chart.
+
+    Signals returned (all raw pixel values, un-normalised):
+      mid         : (wick_high + wick_low) / 2  — overall price level
+      spread      : wick_low - wick_high         — wick-to-wick range (H-L)
+      body_mid    : (body_top + body_bot) / 2   — open/close midpoint
+      body_spread : body_bot - body_top          — body height (conviction)
+      direction   : +1 bull, -1 bear, 0 doji/gap — candle colour per column
+    """
+    if colors is None:
+        colors = TRADINGVIEW_COLORS
+
+    h, w = img_bgr.shape[:2]
+    tc = int(h * top_crop_pct)
+    bc = int(h * bottom_crop_pct)
+    rc = int(w * right_crop_pct)
+
+    chart_bgr = img_bgr[tc: h - bc, 0: w - rc]
+    chart_hsv = cv2.cvtColor(chart_bgr, cv2.COLOR_BGR2HSV)
+    chart_gray = cv2.cvtColor(chart_bgr, cv2.COLOR_BGR2GRAY)
+    ch, cw = chart_bgr.shape[:2]
+
+    # ── Colour masks ──────────────────────────────────────────────────
+    bull_mask = cv2.inRange(chart_hsv,
+                            np.array(colors.bull_lower),
+                            np.array(colors.bull_upper))
+
+    bear_mask = (cv2.inRange(chart_hsv,
+                             np.array(colors.bear_lower1),
+                             np.array(colors.bear_upper1)) |
+                 cv2.inRange(chart_hsv,
+                             np.array(colors.bear_lower2),
+                             np.array(colors.bear_upper2)))
+
+    wick_mask = cv2.inRange(chart_hsv,
+                            np.array(colors.wick_lower),
+                            np.array(colors.wick_upper))
+
+    # Any bright pixel = part of a candle (body or wick)
+    _, candle_mask = cv2.threshold(chart_gray, 60, 255, cv2.THRESH_BINARY)
+
+    # ── Per-column extraction ─────────────────────────────────────────
+    wick_high  = np.full(cw, np.nan)   # topmost candle pixel  (= price high)
+    wick_low   = np.full(cw, np.nan)   # bottommost candle pixel (= price low)
+    body_top   = np.full(cw, np.nan)   # topmost body pixel    (open or close)
+    body_bot   = np.full(cw, np.nan)   # bottommost body pixel (open or close)
+    direction  = np.zeros(cw)          # +1 bull, -1 bear
+
+    for x in range(cw):
+        # Full candle extent (wick tips)
+        all_rows = np.where(candle_mask[:, x] > 0)[0]
+        if len(all_rows) >= 1:
+            wick_high[x] = float(all_rows.min())
+            wick_low[x]  = float(all_rows.max())
+
+        # Bull body
+        g_rows = np.where(bull_mask[:, x] > 0)[0]
+        if len(g_rows) >= 2:
+            body_top[x]  = float(g_rows.min())
+            body_bot[x]  = float(g_rows.max())
+            direction[x] = +1.0
+            continue
+
+        # Bear body
+        r_rows = np.where(bear_mask[:, x] > 0)[0]
+        if len(r_rows) >= 2:
+            body_top[x]  = float(r_rows.min())
+            body_bot[x]  = float(r_rows.max())
+            direction[x] = -1.0
+
+    # ── Interpolate gaps ──────────────────────────────────────────────
+    wick_high = _interp_nans(wick_high)
+    wick_low  = _interp_nans(wick_low)
+    body_top  = _interp_nans(body_top)
+    body_bot  = _interp_nans(body_bot)
+
+    if wick_high is None or wick_low is None:
+        return None
+    if body_top is None:
+        body_top = (wick_high + wick_low) / 2
+    if body_bot is None:
+        body_bot = body_top.copy()
+
+    # ── Smooth ────────────────────────────────────────────────────────
+    win = min(21, max(5, (cw // 5) * 2 + 1))
+    wick_high  = savgol_filter(wick_high,  win, 2)
+    wick_low   = savgol_filter(wick_low,   win, 2)
+    body_top   = savgol_filter(body_top,   win, 2)
+    body_bot   = savgol_filter(body_bot,   win, 2)
+
+    mid_y        = (wick_high + wick_low) / 2.0
+    spread_y     = wick_low  - wick_high          # ≥ 0
+    body_mid_y   = (body_top + body_bot) / 2.0
+    body_spread_y = body_bot - body_top            # ≥ 0
+
+    return ChartSignals(
+        mid=mid_y,
+        spread=spread_y,
+        body_mid=body_mid_y,
+        body_spread=body_spread_y,
+        direction=direction,
+    )
 
 def extract_timestamps(
     img_bgr: np.ndarray,
@@ -433,23 +572,33 @@ def search_chart(
     """
     Slide windows across `signals` and return the best match against `pattern`.
 
+    signal_mode=MID_ONLY : match wick mid only
+    signal_mode=HLC      : match wick mid (65%) + wick spread (35%)
+    signal_mode=CANDLE   : match wick mid (40%) + body mid (40%) + body spread (20%)
+
     fuzz controls matching strictness — see FuzzParams / fuzz_preset().
+    Returns (similarity, start_x, end_x).
     """
     if fuzz is None:
         fuzz = FuzzParams()
 
+    use_candle = (signal_mode == SignalMode.CANDLE)
     use_spread = (signal_mode == SignalMode.HLC)
     res        = fuzz.dtw_resolution
 
-    # Pre-smooth and downsample the pattern at this fuzz resolution
-    pat_mid_smooth = _smooth(pattern.mid, fuzz.smooth_window)
-    pat_mid_ds     = _resample(pat_mid_smooth, res)
+    # ── Pre-compute pattern fingerprints ──────────────────────────────
+    pat_mid_ds = _resample(_smooth(pattern.mid, fuzz.smooth_window), res)
 
-    if use_spread:
+    if use_candle and pattern.has_candle_signals:
+        pat_body_mid_ds    = _resample(_smooth(pattern.body_mid,    fuzz.smooth_window), res)
+        pat_body_spread_ds = _resample(_smooth(pattern.body_spread, fuzz.smooth_window), res)
+        # weights: wick mid 40%, body mid 40%, body spread 20%
+        w_mid = 0.40; w_body_mid = 0.40; w_body_sp = 0.20
+    elif use_spread:
         pat_spread_ds = _resample(_smooth(pattern.spread, fuzz.smooth_window), res)
-        mid_weight    = 1.0 - spread_weight
+        w_mid = 1.0 - spread_weight; w_body_mid = 0.0; w_body_sp = 0.0
     else:
-        mid_weight = 1.0
+        w_mid = 1.0; w_body_mid = 0.0; w_body_sp = 0.0
 
     pat_len   = len(pattern.mid)
     curve_len = signals.length
@@ -460,6 +609,23 @@ def search_chart(
     max_win   = min(curve_len, int(pat_len * max_window_ratio))
     win_sizes = np.linspace(min_win, max_win, 8, dtype=int)
 
+    def _local_norm_flip(arr):
+        """Local normalise + flip Y."""
+        s = _smooth(arr, fuzz.smooth_window)
+        rng = max(s.max() - s.min(), 1e-6)
+        return 1.0 - (s - s.min()) / rng
+
+    def _local_norm(arr):
+        """Local normalise, no flip (for spread / body height)."""
+        s = _smooth(arr, fuzz.smooth_window)
+        rng = max(s.max() - s.min(), 1e-6)
+        return (s - s.min()) / rng
+
+    def _sim(a_ds, b_arr, flip=True):
+        b_n  = _local_norm_flip(b_arr) if flip else _local_norm(b_arr)
+        dist = dtw_distance(a_ds, _resample(b_n, res), fuzz=fuzz)
+        return similarity_score(dist, fuzz=fuzz)
+
     for win_len in win_sizes:
         ctx_half = int(win_len * context_ratio / 2)
 
@@ -469,86 +635,49 @@ def search_chart(
             if mid_range < 1e-6:
                 continue
 
-            # Smooth the candidate window, locally normalise + flip Y
-            seg_mid_s  = _smooth(seg_mid, fuzz.smooth_window)
-            seg_mid_n  = 1.0 - (seg_mid_s - seg_mid_s.min()) / max(seg_mid_s.max() - seg_mid_s.min(), 1e-6)
-            seg_mid_ds = _resample(seg_mid_n, res)
+            mid_sim = _sim(pat_mid_ds, seg_mid, flip=True)
 
-            mid_dist   = dtw_distance(pat_mid_ds, seg_mid_ds, fuzz=fuzz)
-            mid_sim    = similarity_score(mid_dist, fuzz=fuzz)
+            if use_candle and signals.has_candle_signals:
+                body_mid_sim = _sim(pat_body_mid_ds,
+                                    signals.body_mid[start: start + win_len], flip=True)
+                body_sp_sim  = _sim(pat_body_spread_ds,
+                                    signals.body_spread[start: start + win_len], flip=False)
+                shape_sim = (w_mid * mid_sim
+                             + w_body_mid * body_mid_sim
+                             + w_body_sp  * body_sp_sim)
 
-            if use_spread:
-                seg_sp    = signals.spread[start: start + win_len]
-                seg_sp_s  = _smooth(seg_sp, fuzz.smooth_window)
-                sp_range  = seg_sp_s.max() - seg_sp_s.min()
-                if sp_range > 1e-6:
-                    seg_sp_n = (seg_sp_s - seg_sp_s.min()) / sp_range
-                else:
-                    seg_sp_n = np.zeros(len(seg_sp_s))
-                sp_dist    = dtw_distance(pat_spread_ds, _resample(seg_sp_n, res), fuzz=fuzz)
-                spread_sim = similarity_score(sp_dist, fuzz=fuzz)
+            elif use_spread:
+                sp_sim    = _sim(pat_spread_ds,
+                                 signals.spread[start: start + win_len], flip=False)
+                shape_sim = w_mid * mid_sim + spread_weight * sp_sim
+
             else:
-                spread_sim = 0.0
+                shape_sim = mid_sim
 
-            shape_sim = mid_weight * mid_sim + (spread_weight * spread_sim if use_spread else 0.0)
-
-            # Amplitude tiebreaker
+            # Amplitude tiebreaker (context-relative)
             ctx_s     = max(0, start - ctx_half)
             ctx_e     = min(curve_len, start + win_len + ctx_half)
             ctx_range = signals.mid[ctx_s:ctx_e].max() - signals.mid[ctx_s:ctx_e].min()
             amp_ratio = mid_range / ctx_range if ctx_range > 1e-6 else 0.0
 
             combined = 0.80 * shape_sim + 0.20 * amp_ratio
-
             if combined > best_score:
                 best_score, best_start, best_end = combined, start, start + win_len
 
-    # Recalculate reported similarity as pure shape score at best position
-    seg_mid   = signals.mid[best_start:best_end]
-    seg_mid_s = _smooth(seg_mid, fuzz.smooth_window)
-    mid_range = max(seg_mid_s.max() - seg_mid_s.min(), 1e-6)
-    seg_mid_n = 1.0 - (seg_mid_s - seg_mid_s.min()) / mid_range
-    best_mid_sim = similarity_score(
-        dtw_distance(pat_mid_ds, _resample(seg_mid_n, res), fuzz=fuzz), fuzz=fuzz
-    )
+    # ── Recalculate final reported similarity at best position ────────
+    best_sim = _sim(pat_mid_ds,
+                    signals.mid[best_start:best_end], flip=True) * w_mid
 
-    if use_spread:
-        seg_sp   = signals.spread[best_start:best_end]
-        seg_sp_s = _smooth(seg_sp, fuzz.smooth_window)
-        sp_range = max(seg_sp_s.max() - seg_sp_s.min(), 1e-6)
-        seg_sp_n = (seg_sp_s - seg_sp_s.min()) / sp_range
-        best_sp_sim = similarity_score(
-            dtw_distance(pat_spread_ds, _resample(seg_sp_n, res), fuzz=fuzz), fuzz=fuzz
-        )
-        best_sim = mid_weight * best_mid_sim + spread_weight * best_sp_sim
-    else:
-        best_sim = best_mid_sim
+    if use_candle and signals.has_candle_signals:
+        best_sim += (w_body_mid * _sim(pat_body_mid_ds,
+                                       signals.body_mid[best_start:best_end], flip=True)
+                   + w_body_sp  * _sim(pat_body_spread_ds,
+                                       signals.body_spread[best_start:best_end], flip=False))
+    elif use_spread:
+        best_sim += spread_weight * _sim(pat_spread_ds,
+                                         signals.spread[best_start:best_end], flip=False)
 
     return best_sim, best_start, best_end
-    """
-    Slide windows of varying sizes across `signals` and return the best match
-    against `pattern`.
-
-    signal_mode=MID_ONLY : match mid curve only
-    signal_mode=HLC      : match mid (65%) + spread (35%) simultaneously
-                           spread_weight controls the HLC balance
-
-    Each window is locally normalised so shape matching is position-invariant.
-    An amplitude score (relative to wider context) breaks ties.
-
-    Returns (similarity, start_x, end_x).
-    """
-    use_spread = (signal_mode == SignalMode.HLC)
-
-    pat_mid_ds = _resample(pattern.mid, DTW_RESOLUTION)
-    if use_spread:
-        pat_spread_ds = _resample(pattern.spread, DTW_RESOLUTION)
-        mid_weight    = 1.0 - spread_weight
-    else:
-        mid_weight = 1.0
-
-    pat_len   = len(pattern.mid)
-    curve_len = signals.length
 
     best_score, best_start, best_end = 0.0, 0, min(pat_len, curve_len)
 
@@ -685,6 +814,45 @@ def draw_match_highlight(
     # Border line
     cv2.rectangle(result, (x0, 0), (x1, h), color, thickness=2)
     return result
+
+
+def _normalise_signals(signals: ChartSignals, signal_mode: str) -> ChartSignals:
+    """
+    Normalise a raw ChartSignals (as returned by extract_*) to [0,1] for use
+    as a reference pattern. Candidate signals are normalised per-window inside
+    search_chart instead.
+    """
+    mid_n = _norm_flip(signals.mid)
+    if mid_n is None:
+        mid_n = np.zeros(signals.length)
+
+    def norm_positive(arr):
+        """Normalise a ≥0 array (spread, body height) to [0,1]."""
+        rng = arr.max() - arr.min()
+        return (arr - arr.min()) / rng if rng > 1e-6 else np.zeros_like(arr)
+
+    if signal_mode == SignalMode.HLC:
+        spread_n = norm_positive(signals.spread)
+        return ChartSignals(mid=mid_n, spread=spread_n)
+
+    elif signal_mode == SignalMode.CANDLE:
+        spread_n = norm_positive(signals.spread)
+        body_mid_n = _norm_flip(signals.body_mid) if signals.body_mid is not None \
+                     else mid_n.copy()
+        body_spread_n = norm_positive(signals.body_spread) if signals.body_spread is not None \
+                        else np.zeros_like(mid_n)
+        dir_n = signals.direction if signals.direction is not None \
+                else np.zeros_like(mid_n)
+        return ChartSignals(
+            mid=mid_n,
+            spread=spread_n,
+            body_mid=body_mid_n,
+            body_spread=body_spread_n,
+            direction=dir_n,
+        )
+
+    else:  # MID_ONLY
+        return ChartSignals(mid=mid_n, spread=np.zeros_like(mid_n))
 
 
 # ─────────────────────────────────────────────────────────────────────
