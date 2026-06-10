@@ -30,6 +30,8 @@ class MatchResult:
     end_time: str   = ""       # OCR'd timestamp at match end
     symbol: str     = ""       # parsed from filename if available
     timeframe: str  = ""       # parsed from filename if available
+    dtw_similarity: float    = 0.0   # hybrid mode: DTW shape sub-score
+    visual_similarity: float = 0.0   # hybrid mode: visual texture sub-score
 
     @property
     def start_pct(self) -> float:
@@ -532,26 +534,71 @@ def dtw_distance(
     band: int | None = None,
     fuzz: FuzzParams | None = None,
 ) -> float:
+    """
+    Banded (Sakoe-Chiba) DTW distance, normalised by path length.
+
+    Row-vectorised: the cost row and the 2-way min of the previous row are
+    computed with numpy; only the left-neighbour scan remains a Python loop
+    (it has a sequential dependency that can't vectorise).
+    """
     n, m = len(a), len(b)
     if band is None:
         band_pct = fuzz.dtw_band_pct if fuzz else 0.20
         band = max(1, int(band_pct * max(n, m)))
 
-    dtw = np.full((n + 1, m + 1), np.inf)
-    dtw[0, 0] = 0.0
+    INF = np.inf
+    prev = np.full(m + 1, INF)
+    prev[0] = 0.0
+    curr = np.full(m + 1, INF)
+
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+
     for i in range(1, n + 1):
         j_lo = max(1, i - band)
         j_hi = min(m, i + band)
-        for j in range(j_lo, j_hi + 1):
-            cost = abs(float(a[i-1]) - float(b[j-1]))
-            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+        curr.fill(INF)
 
-    return float(dtw[n, m]) / (n + m)
+        # Vectorised: cost row and min(diag, up) for the band
+        cost = np.abs(a[i - 1] - b[j_lo - 1: j_hi])          # len = j_hi-j_lo+1
+        best2 = np.minimum(prev[j_lo: j_hi + 1],              # up
+                           prev[j_lo - 1: j_hi])              # diagonal
+
+        # Sequential left-neighbour scan (cannot vectorise)
+        left = curr[j_lo - 1]
+        for k in range(j_hi - j_lo + 1):
+            v = cost[k] + (best2[k] if best2[k] < left else left)
+            curr[j_lo + k] = v
+            left = v
+
+        prev, curr = curr, prev
+
+    return float(prev[m]) / (n + m)
 
 
 def similarity_score(dist: float, fuzz: FuzzParams | None = None) -> float:
     decay = fuzz.score_decay if fuzz else 10.0
     return float(np.exp(-dist * decay))
+
+
+def _velocity_profile(curve_ds: np.ndarray) -> np.ndarray:
+    """
+    Rate-of-change profile of a normalised, resampled curve, mapped to [0,1].
+
+    This is the signal that distinguishes a sharp move from a slow drift:
+    after window-local price normalisation, a 3-day drift and a 6-hour crash
+    can have identical price *shapes*, but their velocity profiles differ —
+    the crash concentrates movement into a spike, the drift spreads it flat.
+
+    Velocity is normalised by its own max magnitude so the profile captures
+    *where* the movement happens within the window, not absolute speed
+    (which is meaningless across different image resolutions).
+    """
+    v = np.gradient(curve_ds)
+    m = float(np.max(np.abs(v)))
+    if m < 1e-9:
+        return np.full_like(curve_ds, 0.5)
+    return (v / m + 1.0) / 2.0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -567,6 +614,7 @@ def search_chart(
     context_ratio: float = 3.0,
     signal_mode: str = SignalMode.MID_ONLY,
     spread_weight: float = 0.35,
+    velocity_weight: float = 0.30,
     fuzz: FuzzParams | None = None,
 ) -> tuple[float, int, int]:
     """
@@ -575,6 +623,11 @@ def search_chart(
     signal_mode=MID_ONLY : match wick mid only
     signal_mode=HLC      : match wick mid (65%) + wick spread (35%)
     signal_mode=CANDLE   : match wick mid (40%) + body mid (40%) + body spread (20%)
+
+    velocity_weight controls how much the rate-of-change profile contributes
+    to the score (0 = disabled, pure shape matching). Velocity matching
+    distinguishes sharp moves from slow drifts with the same net shape —
+    DTW's time-warping otherwise treats them as identical.
 
     fuzz controls matching strictness — see FuzzParams / fuzz_preset().
     Returns (similarity, start_x, end_x).
@@ -588,6 +641,7 @@ def search_chart(
 
     # ── Pre-compute pattern fingerprints ──────────────────────────────
     pat_mid_ds = _resample(_smooth(pattern.mid, fuzz.smooth_window), res)
+    pat_vel_ds = _velocity_profile(pat_mid_ds)
 
     if use_candle and pattern.has_candle_signals:
         pat_body_mid_ds    = _resample(_smooth(pattern.body_mid,    fuzz.smooth_window), res)
@@ -635,7 +689,28 @@ def search_chart(
             if mid_range < 1e-6:
                 continue
 
-            mid_sim = _sim(pat_mid_ds, seg_mid, flip=True)
+            # Resample once — reused for both shape and velocity matching
+            seg_mid_ds = _resample(_local_norm_flip(seg_mid), res)
+            mid_sim = similarity_score(
+                dtw_distance(pat_mid_ds, seg_mid_ds, fuzz=fuzz), fuzz=fuzz)
+
+            # ── Prune: best possible combined score for this window ──
+            # Assume every not-yet-computed component scores a perfect 1.0;
+            # if even that can't beat the current best, skip the expensive
+            # remaining DTW computations.
+            optimistic_shape = w_mid * mid_sim + (1.0 - w_mid)
+            optimistic = 0.80 * ((1.0 - velocity_weight) * optimistic_shape
+                                 + velocity_weight) + 0.20
+            if optimistic <= best_score:
+                continue
+
+            # Velocity profile match — distinguishes sharp moves from drifts
+            if velocity_weight > 0:
+                vel_sim = similarity_score(
+                    dtw_distance(pat_vel_ds, _velocity_profile(seg_mid_ds),
+                                 fuzz=fuzz), fuzz=fuzz)
+            else:
+                vel_sim = 0.0
 
             if use_candle and signals.has_candle_signals:
                 body_mid_sim = _sim(pat_body_mid_ds,
@@ -654,6 +729,11 @@ def search_chart(
             else:
                 shape_sim = mid_sim
 
+            # Blend velocity into the shape score
+            if velocity_weight > 0:
+                shape_sim = (1.0 - velocity_weight) * shape_sim \
+                            + velocity_weight * vel_sim
+
             # Amplitude tiebreaker (context-relative)
             ctx_s     = max(0, start - ctx_half)
             ctx_e     = min(curve_len, start + win_len + ctx_half)
@@ -665,8 +745,9 @@ def search_chart(
                 best_score, best_start, best_end = combined, start, start + win_len
 
     # ── Recalculate final reported similarity at best position ────────
-    best_sim = _sim(pat_mid_ds,
-                    signals.mid[best_start:best_end], flip=True) * w_mid
+    seg_best_ds = _resample(_local_norm_flip(signals.mid[best_start:best_end]), res)
+    best_sim = similarity_score(
+        dtw_distance(pat_mid_ds, seg_best_ds, fuzz=fuzz), fuzz=fuzz) * w_mid
 
     if use_candle and signals.has_candle_signals:
         best_sim += (w_body_mid * _sim(pat_body_mid_ds,
@@ -677,77 +758,93 @@ def search_chart(
         best_sim += spread_weight * _sim(pat_spread_ds,
                                          signals.spread[best_start:best_end], flip=False)
 
-    return best_sim, best_start, best_end
-
-    best_score, best_start, best_end = 0.0, 0, min(pat_len, curve_len)
-
-    min_win   = max(10, int(pat_len * min_window_ratio))
-    max_win   = min(curve_len, int(pat_len * max_window_ratio))
-    win_sizes = np.linspace(min_win, max_win, 8, dtype=int)
-
-    for win_len in win_sizes:
-        ctx_half = int(win_len * context_ratio / 2)
-
-        for start in range(0, curve_len - win_len + 1, stride):
-            seg_mid = signals.mid[start: start + win_len]
-            mid_range = seg_mid.max() - seg_mid.min()
-            if mid_range < 1e-6:
-                continue
-
-            # LOCAL normalise mid + flip Y
-            seg_mid_n  = 1.0 - (seg_mid - seg_mid.min()) / mid_range
-            mid_sim    = similarity_score(dtw_distance(pat_mid_ds,
-                                                        _resample(seg_mid_n, DTW_RESOLUTION)))
-
-            if use_spread:
-                seg_sp    = signals.spread[start: start + win_len]
-                sp_range  = seg_sp.max() - seg_sp.min()
-                if sp_range > 1e-6:
-                    seg_sp_n  = (seg_sp - seg_sp.min()) / sp_range
-                else:
-                    seg_sp_n  = np.zeros(win_len)
-                spread_sim = similarity_score(dtw_distance(pat_spread_ds,
-                                                            _resample(seg_sp_n, DTW_RESOLUTION)))
-            else:
-                spread_sim = 0.0
-
-            shape_sim = mid_weight * mid_sim + (spread_weight * spread_sim if use_spread else 0.0)
-
-            # Amplitude tiebreaker (context-relative)
-            ctx_s     = max(0, start - ctx_half)
-            ctx_e     = min(curve_len, start + win_len + ctx_half)
-            ctx_range = signals.mid[ctx_s:ctx_e].max() - signals.mid[ctx_s:ctx_e].min()
-            amp_ratio = mid_range / ctx_range if ctx_range > 1e-6 else 0.0
-
-            combined = 0.80 * shape_sim + 0.20 * amp_ratio
-
-            if combined > best_score:
-                best_score, best_start, best_end = combined, start, start + win_len
-
-    # Recalculate reported similarity as pure shape score at best position
-    seg_mid = signals.mid[best_start:best_end]
-    mid_range = max(seg_mid.max() - seg_mid.min(), 1e-6)
-    seg_mid_n = 1.0 - (seg_mid - seg_mid.min()) / mid_range
-    best_mid_sim = similarity_score(dtw_distance(pat_mid_ds,
-                                                  _resample(seg_mid_n, DTW_RESOLUTION)))
-
-    if use_spread:
-        seg_sp   = signals.spread[best_start:best_end]
-        sp_range = max(seg_sp.max() - seg_sp.min(), 1e-6)
-        seg_sp_n = (seg_sp - seg_sp.min()) / sp_range
-        best_sp_sim = similarity_score(dtw_distance(pat_spread_ds,
-                                                     _resample(seg_sp_n, DTW_RESOLUTION)))
-        best_sim = mid_weight * best_mid_sim + spread_weight * best_sp_sim
-    else:
-        best_sim = best_mid_sim
+    if velocity_weight > 0:
+        best_vel_sim = similarity_score(
+            dtw_distance(pat_vel_ds, _velocity_profile(seg_best_ds), fuzz=fuzz),
+            fuzz=fuzz)
+        best_sim = (1.0 - velocity_weight) * best_sim \
+                   + velocity_weight * best_vel_sim
 
     return best_sim, best_start, best_end
+
+
+
+def score_window(
+    pattern: ChartSignals,
+    signals: ChartSignals,
+    start: int,
+    end: int,
+    signal_mode: str = SignalMode.MID_ONLY,
+    spread_weight: float = 0.35,
+    velocity_weight: float = 0.30,
+    fuzz: FuzzParams | None = None,
+) -> float:
+    """
+    DTW-score a SPECIFIC window of `signals` against `pattern`, without
+    searching.  Used by the hybrid engine to cross-score a window proposed
+    by the visual engine.  Mirrors the scoring in search_chart.
+
+    Returns similarity in [0, 1]; 0.0 if the window is degenerate.
+    """
+    if fuzz is None:
+        fuzz = FuzzParams()
+
+    start = max(0, int(start))
+    end   = min(signals.length, int(end))
+    if end - start < 10:
+        return 0.0
+
+    seg_mid = signals.mid[start:end]
+    if seg_mid.max() - seg_mid.min() < 1e-6:
+        return 0.0
+
+    res = fuzz.dtw_resolution
+    pat_mid_ds = _resample(_smooth(pattern.mid, fuzz.smooth_window), res)
+    pat_vel_ds = _velocity_profile(pat_mid_ds)
+
+    def _norm_flip_local(arr):
+        s = _smooth(arr, fuzz.smooth_window)
+        rng = max(s.max() - s.min(), 1e-6)
+        return 1.0 - (s - s.min()) / rng
+
+    def _norm_local(arr):
+        s = _smooth(arr, fuzz.smooth_window)
+        rng = max(s.max() - s.min(), 1e-6)
+        return (s - s.min()) / rng
+
+    seg_mid_ds = _resample(_norm_flip_local(seg_mid), res)
+    sim = similarity_score(
+        dtw_distance(pat_mid_ds, seg_mid_ds, fuzz=fuzz), fuzz=fuzz)
+
+    use_candle = (signal_mode == SignalMode.CANDLE)
+    use_spread = (signal_mode == SignalMode.HLC)
+
+    if use_candle and pattern.has_candle_signals and signals.has_candle_signals:
+        pat_bm_ds = _resample(_smooth(pattern.body_mid,    fuzz.smooth_window), res)
+        pat_bs_ds = _resample(_smooth(pattern.body_spread, fuzz.smooth_window), res)
+        bm = _resample(_norm_flip_local(signals.body_mid[start:end]), res)
+        bs = _resample(_norm_local(signals.body_spread[start:end]), res)
+        bm_sim = similarity_score(dtw_distance(pat_bm_ds, bm, fuzz=fuzz), fuzz=fuzz)
+        bs_sim = similarity_score(dtw_distance(pat_bs_ds, bs, fuzz=fuzz), fuzz=fuzz)
+        sim = 0.40 * sim + 0.40 * bm_sim + 0.20 * bs_sim
+    elif use_spread:
+        pat_sp_ds = _resample(_smooth(pattern.spread, fuzz.smooth_window), res)
+        sp = _resample(_norm_local(signals.spread[start:end]), res)
+        sp_sim = similarity_score(dtw_distance(pat_sp_ds, sp, fuzz=fuzz), fuzz=fuzz)
+        sim = (1.0 - spread_weight) * sim + spread_weight * sp_sim
+
+    if velocity_weight > 0:
+        vel_sim = similarity_score(
+            dtw_distance(pat_vel_ds, _velocity_profile(seg_mid_ds), fuzz=fuzz),
+            fuzz=fuzz)
+        sim = (1.0 - velocity_weight) * sim + velocity_weight * vel_sim
+
+    return float(sim)
 
 
 # ─────────────────────────────────────────────────────────────────────
 #  FILENAME METADATA PARSING
 # ─────────────────────────────────────────────────────────────────────
-
 def parse_filename_metadata(path: str) -> dict:
     """
     Attempt to parse symbol, timeframe, and datetime from a filename.
@@ -792,13 +889,16 @@ def draw_match_highlight(
     img_bgr: np.ndarray,
     start_pct: float,
     end_pct: float,
-    right_crop_pct: float = 0.07,
+    right_crop_pct: float = 0.09,
     color: tuple = (0, 255, 100),
     alpha: float = 0.25,
 ) -> np.ndarray:
     """
     Draw a semi-transparent highlight over the matched region.
     Returns a new BGR image.
+
+    right_crop_pct must match the crop used during extraction (0.09),
+    otherwise the highlight is horizontally offset from the true match.
     """
     h, w = img_bgr.shape[:2]
     rc = int(w * right_crop_pct)

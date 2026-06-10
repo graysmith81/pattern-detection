@@ -273,14 +273,25 @@ def _ssim_at_position(
 def prepare_visual_reference(
     ref_img_bgr: np.ndarray,
     params: VisualMatchParams | None = None,
+    apply_crop: bool = False,
 ) -> np.ndarray | None:
     """
     Extract and binarise the chart area from the reference image.
+
+    apply_crop=False (default): the image is used as-is.  This matches
+    engine.extract_pattern's behaviour for references — the expected workflow
+    is a tight crop of just the pattern, with no axis labels to remove.
+    Set apply_crop=True if the reference is a full chart screenshot with
+    axis/label areas.
+
     Returns a 2-D uint8 binary image, or None if extraction fails.
     """
     if params is None:
         params = VisualMatchParams()
-    gray   = _crop_chart_region(ref_img_bgr)
+    if apply_crop:
+        gray = _crop_chart_region(ref_img_bgr)
+    else:
+        gray = cv2.cvtColor(ref_img_bgr, cv2.COLOR_BGR2GRAY)
     binary = _binarise(gray, params.binarise_thresh)
     if binary.sum() < 500:
         return None
@@ -365,6 +376,76 @@ def visual_search_chart(
     end_pct   = min(best_end / max(cand_w, 1), 1.0)
 
     return float(similarity), float(start_pct), float(end_pct)
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  TARGETED SCORING — verify a specific window (hybrid mode)
+# ─────────────────────────────────────────────────────────────────────
+
+def visual_score_at(
+    ref_patch: np.ndarray,
+    cand_img_bgr: np.ndarray,
+    start_pct: float,
+    end_pct: float,
+    params: VisualMatchParams | None = None,
+) -> float:
+    """
+    Score how visually similar a SPECIFIC window of the candidate chart is
+    to the reference patch.  Used by the hybrid engine to verify the window
+    that DTW selected, rather than searching independently.
+
+    The score is the z-score of the NCC value at the given position relative
+    to the full heatmap at that template width — i.e. "does this particular
+    window stand out as a match compared to everywhere else on this chart?"
+
+    Returns a float in [0, 1].
+    """
+    if params is None:
+        params = VisualMatchParams()
+
+    cand_gray = _crop_chart_region(cand_img_bgr)
+    cand_bin  = _binarise(cand_gray, params.binarise_thresh)
+    cand_h, cand_w = cand_bin.shape
+    cand_f32  = cand_bin.astype(np.float32)
+
+    start_px = int(np.clip(start_pct, 0.0, 1.0) * cand_w)
+    end_px   = int(np.clip(end_pct,   0.0, 1.0) * cand_w)
+    win_w    = end_px - start_px
+    if win_w < _MIN_PATCH_W:
+        return 0.0
+
+    # DTW's window boundaries are approximate — its pixel positions come from
+    # 1-D signal space and won't align exactly with the visual optimum.
+    # Try a few width variants and allow positional tolerance proportional to
+    # the window size; report the best.
+    best = 0.0
+    for w_factor in (0.85, 1.0, 1.15):
+        t_w = int(win_w * w_factor)
+        if t_w < _MIN_PATCH_W or t_w > cand_w:
+            continue
+
+        template_u8  = _make_template(ref_patch, t_w, cand_h)
+        template_f32 = template_u8.astype(np.float32)
+
+        heatmap = _ncc_heatmap(template_f32, cand_f32)
+        if heatmap.size == 0:
+            continue
+        std = float(np.std(heatmap))
+        if std < 1e-8:
+            continue
+
+        # Positional tolerance: ±20% of window width around the DTW start
+        tol = max(1, int(win_w * 0.20))
+        lo  = max(0, start_px - tol)
+        hi  = min(len(heatmap), start_px + tol + 1)
+        if lo >= hi:
+            continue
+        val_at = float(heatmap[lo:hi].max())
+
+        z = (val_at - float(np.mean(heatmap))) / std
+        best = max(best, float(np.clip(z / _ZSCORE_CAP, 0.0, 1.0)))
+
+    return best
 
 
 # ─────────────────────────────────────────────────────────────────────
