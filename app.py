@@ -3,6 +3,11 @@ app.py — Chart Pattern Matcher — Streamlit UI
 ----------------------------------------------
 Run with:
     streamlit run app.py
+
+Two matching engines are available via tabs:
+  • DTW (Dynamic Time Warping) — original pixel-signal sliding-window search
+  • CNN Embedding             — zero-shot ResNet/EfficientNet cosine retrieval
+                               (only shown when torch + torchvision are installed)
 """
 
 from pathlib import Path
@@ -29,6 +34,23 @@ from engine import (
     CandleColors,
     TRADINGVIEW_COLORS,
 )
+
+# CNN engine — optional; degrades gracefully if PyTorch is absent
+try:
+    from embedder import (
+        TORCH_AVAILABLE,
+        load_model,
+        embed_image,
+        build_index,
+        save_index,
+        load_index,
+        query_index,
+        EmbedResult,
+        ChartIndex,
+    )
+except ImportError:
+    TORCH_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG
@@ -70,6 +92,15 @@ st.markdown("""
     }
     .signal-hlc { color: #ffd54f !important; }
     .signal-mid { color: #90caf9 !important; }
+    .cnn-badge {
+        display: inline-block;
+        background: #1b3a2d;
+        border-radius: 20px;
+        padding: 3px 12px;
+        font-size: 0.8rem;
+        color: #69f0ae;
+        margin-bottom: 8px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,7 +112,8 @@ st.markdown("""
 with st.sidebar:
     st.title("⚙️ Settings")
 
-    st.subheader("Reference mode")
+    # ── DTW settings ──────────────────────────────────────────────────
+    st.subheader("DTW — Reference mode")
     ref_mode_label = st.radio(
         "How is the pattern defined?",
         options=["Plain line chart", "Drawn markup line"],
@@ -97,7 +129,7 @@ with st.sidebar:
         else ReferenceMode.DRAWN_LINE
     )
 
-    st.subheader("Signal mode")
+    st.subheader("DTW — Signal mode")
     st.caption(
         "Choose which signals to extract and match. "
         "Both images must use the same chart type to unlock richer matching."
@@ -144,8 +176,8 @@ with st.sidebar:
     else:
         spread_weight = 0.35
 
-    st.subheader("Search")
-    threshold = st.slider("Minimum similarity", 0.20, 0.95, 0.40, 0.05)
+    st.subheader("DTW — Search")
+    threshold = st.slider("Minimum similarity (DTW)", 0.20, 0.95, 0.40, 0.05)
     top_n     = st.slider("Max results", 1, 20, 8)
     stride    = st.select_slider(
         "Search precision",
@@ -192,7 +224,6 @@ with st.sidebar:
             )
         else:
             fuzz_params = fuzz_preset(fuzz_level)
-            # Show what the master slider resolved to
             st.caption(
                 f"→ Resolution: **{fuzz_params.dtw_resolution}** pts  |  "
                 f"Warp: **{fuzz_params.dtw_band_pct:.0%}**  |  "
@@ -206,6 +237,40 @@ with st.sidebar:
         help="Brightness cutoff for the price line",
     )
 
+    # ── CNN settings ──────────────────────────────────────────────────
+    if TORCH_AVAILABLE:
+        st.subheader("CNN — Embedding")
+        cnn_backbone = st.selectbox(
+            "Backbone",
+            options=["resnet50", "efficientnet_b0"],
+            index=0,
+            help="resnet50 → 2048-dim · efficientnet_b0 → 1280-dim",
+        )
+        cnn_threshold = st.slider(
+            "Minimum similarity (CNN)", 0.00, 1.00, 0.50, 0.01,
+            help="Cosine similarity cutoff for CNN results",
+        )
+
+        st.subheader("CNN — Index")
+        index_path = st.text_input(
+            "Index file path",
+            value="chart_index.npz",
+            help="Embeddings are saved/loaded here so charts are not re-embedded each session",
+        )
+        col_save, col_clear = st.columns(2)
+        with col_save:
+            save_index_btn = st.button("💾 Save index", use_container_width=True,
+                                       help="Save the current in-memory index to disk")
+        with col_clear:
+            clear_index_btn = st.button("🗑️ Clear index", use_container_width=True,
+                                        help="Remove in-memory index (disk file is kept)")
+    else:
+        cnn_backbone   = "resnet50"
+        cnn_threshold  = 0.50
+        index_path     = "chart_index.npz"
+        save_index_btn = False
+        clear_index_btn = False
+
     st.subheader("TradingView MCP")
     st.info(
         "Connect a TradingView MCP server to auto-populate candidate charts.\n\n"
@@ -214,7 +279,28 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Chart Pattern Matcher v1.2")
+    st.caption("Chart Pattern Matcher v1.3")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SESSION STATE — CNN index
+# ─────────────────────────────────────────────────────────────────────
+
+if "cnn_index" not in st.session_state:
+    st.session_state.cnn_index = None    # ChartIndex | None
+
+# Handle sidebar index actions
+if TORCH_AVAILABLE:
+    if clear_index_btn:
+        st.session_state.cnn_index = None
+        st.sidebar.success("In-memory index cleared.")
+
+    if save_index_btn:
+        if st.session_state.cnn_index is not None and st.session_state.cnn_index.size > 0:
+            save_index(st.session_state.cnn_index, index_path)
+            st.sidebar.success(f"Index saved → {index_path}")
+        else:
+            st.sidebar.warning("Nothing to save — run CNN search first to build the index.")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -224,8 +310,9 @@ with st.sidebar:
 st.title("📈 Chart Pattern Matcher")
 st.caption("Upload a reference pattern → drop candidate charts → find visual matches")
 
+
 # ─────────────────────────────────────────────────────────────────────
-#  REFERENCE UPLOAD
+#  REFERENCE UPLOAD  (shared by both engines)
 # ─────────────────────────────────────────────────────────────────────
 
 col_ref, col_cands = st.columns([1, 1], gap="large")
@@ -300,7 +387,6 @@ with col_ref:
         if pattern is not None:
             st.success(f"✓ Pattern extracted — {pattern.length} sample points")
 
-            # Show extracted signals
             chart_data = {"Mid (price shape)": pattern.mid.tolist()}
             if ref_signal == SignalMode.HLC and pattern.spread.max() > 0.01:
                 chart_data["Spread (H-L width)"] = pattern.spread.tolist()
@@ -320,7 +406,7 @@ with col_ref:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  CANDIDATE CHARTS
+#  CANDIDATE CHARTS  (shared by both engines)
 # ─────────────────────────────────────────────────────────────────────
 
 with col_cands:
@@ -361,162 +447,383 @@ with col_cands:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  MATCHING MODE SUMMARY
+#  SHARED RESULT RENDERER  (DTW)
+#  Defined before the tabs so it is in scope when called inside Tab 1.
 # ─────────────────────────────────────────────────────────────────────
 
-if pattern is not None and cand_files:
-    if match_signal == SignalMode.HLC:
-        st.info(
-            f"🟡 **HLC matching** — comparing mid-price shape "
-            f"({100-int(spread_weight*100)}%) + H-L spread ({int(spread_weight*100)}%)",
-            icon="ℹ️",
-        )
-    else:
-        note = ""
-        if ref_signal != cand_signal:
-            note = " (HLC spread ignored — both images must be HLC to use spread matching)"
-        st.info(f"🔵 **Mid-only matching** — shape comparison only{note}", icon="ℹ️")
+def _render_dtw_results(results: list, cand_files: list) -> None:
+    """Render DTW MatchResult cards.  Identical to the original app.py output."""
+    for rank, result in enumerate(results, 1):
+        sim_pct = result.similarity
+        colour  = "#00e676" if sim_pct >= 0.6 else "#ff9800"
+
+        hcol1, hcol2 = st.columns([3, 1])
+        with hcol1:
+            tags = ""
+            if result.symbol:
+                tags += f'<span class="meta-tag">{result.symbol}</span>'
+            if result.timeframe:
+                tags += f'<span class="meta-tag">{result.timeframe}</span>'
+            st.markdown(
+                f"**#{rank} — {Path(result.chart_path).stem}** &nbsp; {tags}",
+                unsafe_allow_html=True,
+            )
+        with hcol2:
+            st.markdown(
+                f'<div style="text-align:right;font-size:1.5rem;'
+                f'font-weight:bold;color:{colour}">{sim_pct:.1%}</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.progress(sim_pct)
+
+        if result.start_time and result.end_time:
+            time_str = (
+                f'<span class="time-badge">⏱ {result.start_time} → {result.end_time}</span>'
+            )
+        else:
+            time_str = (
+                f'<span class="time-badge">'
+                f'📍 {result.start_pct:.0%} – {result.end_pct:.0%} of chart width'
+                f'</span>'
+            )
+        st.markdown(time_str, unsafe_allow_html=True)
+
+        match_file = next((f for f in cand_files if f.name == result.chart_path), None)
+        if match_file:
+            match_file.seek(0)
+            match_img   = image_from_bytes(match_file.read())
+            highlighted = draw_match_highlight(match_img, result.start_pct, result.end_pct)
+            st.image(
+                cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB),
+                use_container_width=True,
+                caption="Match region highlighted in green",
+            )
+            _, buf = cv2.imencode(".png", highlighted)
+            st.download_button(
+                label="⬇ Download highlighted image",
+                data=buf.tobytes(),
+                file_name=f"match_{rank}_{result.chart_path}",
+                mime="image/png",
+                key=f"dtw_dl_{rank}",
+            )
+
+        st.divider()
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH
+#  ENGINE TABS
 # ─────────────────────────────────────────────────────────────────────
 
 st.divider()
-run_disabled = (pattern is None) or (not cand_files)
 
-if st.button(
-    "🔍 Search for pattern",
-    disabled=run_disabled,
-    type="primary",
-    use_container_width=True,
-):
-    st.subheader("③ Results")
-    st.caption(
-        f"Fuzziness: **{fuzz_level:.0%}** — "
-        f"Resolution {fuzz_params.dtw_resolution}pt · "
-        f"Warp {fuzz_params.dtw_band_pct:.0%} · "
-        f"Decay {fuzz_params.score_decay:.1f} · "
-        f"Smooth {fuzz_params.smooth_window}px"
-    )
+tab_labels = ["🔵 DTW matching"]
+if TORCH_AVAILABLE:
+    tab_labels.append("🟢 CNN embedding")
 
-    results: list[MatchResult] = []
-    prog = st.progress(0, text="Searching…")
+tabs = st.tabs(tab_labels)
 
-    for i, f in enumerate(cand_files):
-        f.seek(0)
-        img_bgr = image_from_bytes(f.read())
-        prog.progress(i / len(cand_files), text=f"Searching {f.name}…")
 
-        if cand_signal == SignalMode.CANDLE:
-            signals = extract_candlestick(img_bgr)
+# ═════════════════════════════════════════════════════════════════════
+#  TAB 1 — DTW  (completely unchanged logic)
+# ═════════════════════════════════════════════════════════════════════
+
+with tabs[0]:
+
+    if pattern is not None and cand_files:
+        if match_signal == SignalMode.HLC:
+            st.info(
+                f"🟡 **HLC matching** — comparing mid-price shape "
+                f"({100-int(spread_weight*100)}%) + H-L spread ({int(spread_weight*100)}%)",
+                icon="ℹ️",
+            )
         else:
-            signals = extract_price_curve(img_bgr, brightness_threshold=brightness_thresh)
-        if signals is None:
-            continue
+            note = ""
+            if ref_signal != cand_signal:
+                note = " (HLC spread ignored — both images must be HLC to use spread matching)"
+            st.info(f"🔵 **Mid-only matching** — shape comparison only{note}", icon="ℹ️")
 
-        sim, sx, ex = search_chart(
-            pattern, signals,
-            stride=stride,
-            signal_mode=match_signal,
-            spread_weight=spread_weight,
-            fuzz=fuzz_params,
+    run_disabled = (pattern is None) or (not cand_files)
+
+    if st.button(
+        "🔍 Search for pattern",
+        disabled=run_disabled,
+        type="primary",
+        use_container_width=True,
+        key="dtw_run",
+    ):
+        st.subheader("③ Results")
+        st.caption(
+            f"Fuzziness: **{fuzz_level:.0%}** — "
+            f"Resolution {fuzz_params.dtw_resolution}pt · "
+            f"Warp {fuzz_params.dtw_band_pct:.0%} · "
+            f"Decay {fuzz_params.score_decay:.1f} · "
+            f"Smooth {fuzz_params.smooth_window}px"
         )
 
-        timestamps = extract_timestamps(img_bgr)
-        start_time = interpolate_time(sx / max(signals.length, 1), timestamps)
-        end_time   = interpolate_time(ex / max(signals.length, 1), timestamps)
-        meta       = parse_filename_metadata(f.name)
+        results: list[MatchResult] = []
+        prog = st.progress(0, text="Searching…")
 
-        results.append(MatchResult(
-            chart_path=f.name,
-            similarity=sim,
-            match_start_x=sx,
-            match_end_x=ex,
-            curve_len=signals.length,
-            start_time=start_time,
-            end_time=end_time,
-            symbol=meta["symbol"],
-            timeframe=meta["timeframe"],
-        ))
+        for i, f in enumerate(cand_files):
+            f.seek(0)
+            img_bgr = image_from_bytes(f.read())
+            prog.progress(i / len(cand_files), text=f"Searching {f.name}…")
 
-    prog.progress(1.0, text="Done")
+            if cand_signal == SignalMode.CANDLE:
+                signals = extract_candlestick(img_bgr)
+            else:
+                signals = extract_price_curve(img_bgr, brightness_threshold=brightness_thresh)
+            if signals is None:
+                continue
 
-    results = sorted(
-        [r for r in results if r.similarity >= threshold],
-        key=lambda r: r.similarity,
-        reverse=True,
-    )[:top_n]
+            sim, sx, ex = search_chart(
+                pattern, signals,
+                stride=stride,
+                signal_mode=match_signal,
+                spread_weight=spread_weight,
+                fuzz=fuzz_params,
+            )
 
-    if not results:
-        st.warning(
-            f"No matches found above {threshold:.0%} similarity. "
-            "Try lowering the threshold in the sidebar."
+            timestamps = extract_timestamps(img_bgr)
+            start_time = interpolate_time(sx / max(signals.length, 1), timestamps)
+            end_time   = interpolate_time(ex / max(signals.length, 1), timestamps)
+            meta       = parse_filename_metadata(f.name)
+
+            results.append(MatchResult(
+                chart_path=f.name,
+                similarity=sim,
+                match_start_x=sx,
+                match_end_x=ex,
+                curve_len=signals.length,
+                start_time=start_time,
+                end_time=end_time,
+                symbol=meta["symbol"],
+                timeframe=meta["timeframe"],
+            ))
+
+        prog.progress(1.0, text="Done")
+
+        results = sorted(
+            [r for r in results if r.similarity >= threshold],
+            key=lambda r: r.similarity,
+            reverse=True,
+        )[:top_n]
+
+        if not results:
+            st.warning(
+                f"No matches found above {threshold:.0%} similarity. "
+                "Try lowering the threshold in the sidebar."
+            )
+        else:
+            st.success(f"Found {len(results)} match(es)")
+            _render_dtw_results(results, cand_files)
+
+    elif run_disabled:
+        if pattern is None and not cand_files:
+            st.info("Upload a reference image and candidate charts to begin.")
+        elif pattern is None:
+            st.info("Upload a reference image to begin.")
+        else:
+            st.info("Upload candidate charts to search.")
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  TAB 2 — CNN  (only present when TORCH_AVAILABLE)
+# ═════════════════════════════════════════════════════════════════════
+
+if TORCH_AVAILABLE:
+    with tabs[1]:
+
+        st.markdown(
+            '<div class="cnn-badge">🟢 Zero-shot CNN embedding · cosine similarity retrieval</div>',
+            unsafe_allow_html=True,
         )
-    else:
-        st.success(f"Found {len(results)} match(es)")
+        st.caption(
+            f"Backbone: **{cnn_backbone}** · "
+            "Invariant to scale, magnitude, and time-stretch by design "
+            "(all crops are resized to a fixed 224×224 canvas before embedding)."
+        )
 
-        for rank, result in enumerate(results, 1):
-            sim_pct = result.similarity
-            colour  = "#00e676" if sim_pct >= 0.6 else "#ff9800"
+        # ── Index status ──────────────────────────────────────────────
+        idx: ChartIndex | None = st.session_state.cnn_index
 
-            hcol1, hcol2 = st.columns([3, 1])
-            with hcol1:
-                tags = ""
-                if result.symbol:
-                    tags += f'<span class="meta-tag">{result.symbol}</span>'
-                if result.timeframe:
-                    tags += f'<span class="meta-tag">{result.timeframe}</span>'
-                st.markdown(
-                    f"**#{rank} — {Path(result.chart_path).stem}** &nbsp; {tags}",
-                    unsafe_allow_html=True,
-                )
-            with hcol2:
-                st.markdown(
-                    f'<div style="text-align:right;font-size:1.5rem;'
-                    f'font-weight:bold;color:{colour}">{sim_pct:.1%}</div>',
-                    unsafe_allow_html=True,
-                )
-
-            st.progress(sim_pct)
-
-            if result.start_time and result.end_time:
-                time_str = (
-                    f'<span class="time-badge">⏱ {result.start_time} → {result.end_time}</span>'
+        col_idx_a, col_idx_b = st.columns([3, 1])
+        with col_idx_a:
+            if idx is not None and idx.size > 0:
+                st.success(
+                    f"✓ Index ready — **{idx.size}** chart(s) embedded "
+                    f"with `{idx.backbone}`"
                 )
             else:
-                time_str = (
-                    f'<span class="time-badge">'
-                    f'📍 {result.start_pct:.0%} – {result.end_pct:.0%} of chart width'
-                    f'</span>'
-                )
-            st.markdown(time_str, unsafe_allow_html=True)
+                st.info("No index in memory. Run a search to build one, or load from disk.")
+        with col_idx_b:
+            if st.button("📂 Load index from disk", use_container_width=True, key="cnn_load"):
+                try:
+                    loaded = load_index(index_path)
+                    st.session_state.cnn_index = loaded
+                    st.success(f"Loaded {loaded.size} embeddings from {index_path}")
+                    st.rerun()
+                except FileNotFoundError:
+                    st.error(f"File not found: {index_path}")
 
-            match_file = next((f for f in cand_files if f.name == result.chart_path), None)
-            if match_file:
-                match_file.seek(0)
-                match_img   = image_from_bytes(match_file.read())
-                highlighted = draw_match_highlight(match_img, result.start_pct, result.end_pct)
-                st.image(
-                    cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB),
-                    use_container_width=True,
-                    caption="Match region highlighted in green",
-                )
-                _, buf = cv2.imencode(".png", highlighted)
-                st.download_button(
-                    label="⬇ Download highlighted image",
-                    data=buf.tobytes(),
-                    file_name=f"match_{rank}_{result.chart_path}",
-                    mime="image/png",
-                    key=f"dl_{rank}",
-                )
+        # ── Search button ─────────────────────────────────────────────
+        cnn_disabled = (ref_img_bgr is None) or (not cand_files)
 
-            st.divider()
+        if st.button(
+            "🔍 Search with CNN",
+            disabled=cnn_disabled,
+            type="primary",
+            use_container_width=True,
+            key="cnn_run",
+        ):
+            # 1. Load / reuse backbone
+            with st.spinner(f"Loading {cnn_backbone} (first run downloads weights)…"):
+                try:
+                    model = load_model(cnn_backbone)
+                except Exception as e:
+                    st.error(f"Failed to load backbone: {e}")
+                    st.stop()
 
-elif run_disabled:
-    if pattern is None and not cand_files:
-        st.info("Upload a reference image and candidate charts to begin.")
-    elif pattern is None:
-        st.info("Upload a reference image to begin.")
-    else:
-        st.info("Upload candidate charts to search.")
+            # 2. Embed reference image
+            with st.spinner("Embedding reference chart…"):
+                try:
+                    query_vec = embed_image(ref_img_bgr, model)
+                except Exception as e:
+                    st.error(f"Reference embedding failed: {e}")
+                    st.stop()
+
+            # 3. Build / update index from candidate files
+            #    If the existing index was built with the same backbone and
+            #    already contains all currently uploaded filenames, reuse it.
+            existing: ChartIndex | None = st.session_state.cnn_index
+            uploaded_names = {f.name for f in cand_files}
+
+            need_rebuild = (
+                existing is None
+                or existing.size == 0
+                or existing.backbone != cnn_backbone
+                or not uploaded_names.issubset(set(existing.filenames))
+            )
+
+            if need_rebuild:
+                # Collect (name, bytes) pairs — seek to 0 first
+                image_pairs = []
+                for f in cand_files:
+                    f.seek(0)
+                    image_pairs.append((f.name, f.read()))
+
+                prog = st.progress(0, text="Building embedding index…")
+
+                def _cb(i, total, name):
+                    prog.progress(
+                        i / max(total, 1),
+                        text=f"Embedding {Path(name).stem[:30]}… ({i+1}/{total})"
+                    )
+
+                with st.spinner("Embedding candidate charts…"):
+                    new_index = build_index(image_pairs, model,
+                                            backbone=cnn_backbone,
+                                            progress_callback=_cb)
+
+                prog.progress(1.0, text="Done")
+                st.session_state.cnn_index = new_index
+                idx = new_index
+            else:
+                idx = existing
+                st.caption("♻️ Reusing existing index (same backbone, same files).")
+
+            if idx.size == 0:
+                st.warning("No charts could be embedded. Check the uploaded images.")
+                st.stop()
+
+            # 4. Query
+            results_cnn = query_index(
+                idx,
+                query_vec,
+                top_n=top_n,
+                threshold=cnn_threshold,
+            )
+
+            # Restore file seek positions for display
+            for f in cand_files:
+                f.seek(0)
+
+            # 5. Render results
+            st.subheader("③ Results")
+            st.caption(
+                f"Cosine similarity threshold: **{cnn_threshold:.0%}** · "
+                f"Showing top **{top_n}**"
+            )
+
+            if not results_cnn:
+                st.warning(
+                    f"No matches found above {cnn_threshold:.0%} cosine similarity. "
+                    "Try lowering the threshold in the sidebar."
+                )
+            else:
+                st.success(f"Found {len(results_cnn)} match(es)")
+
+                for rank, result in enumerate(results_cnn, 1):
+                    sim_pct = result.similarity
+                    colour  = "#00e676" if sim_pct >= 0.70 else "#ff9800"
+
+                    hcol1, hcol2 = st.columns([3, 1])
+                    with hcol1:
+                        tags = ""
+                        if result.symbol:
+                            tags += f'<span class="meta-tag">{result.symbol}</span>'
+                        if result.timeframe:
+                            tags += f'<span class="meta-tag">{result.timeframe}</span>'
+                        if result.datetime:
+                            tags += f'<span class="meta-tag">{result.datetime}</span>'
+                        st.markdown(
+                            f"**#{rank} — {Path(result.chart_path).stem}** &nbsp; {tags}",
+                            unsafe_allow_html=True,
+                        )
+                    with hcol2:
+                        st.markdown(
+                            f'<div style="text-align:right;font-size:1.5rem;'
+                            f'font-weight:bold;color:{colour}">{sim_pct:.1%}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    st.progress(sim_pct)
+
+                    # CNN match is whole-image — highlight the full chart width
+                    match_file = next(
+                        (f for f in cand_files if f.name == result.chart_path), None
+                    )
+                    if match_file:
+                        match_file.seek(0)
+                        match_img   = image_from_bytes(match_file.read())
+                        # Full-width highlight (0 % → 100 %)
+                        highlighted = draw_match_highlight(
+                            match_img, start_pct=0.0, end_pct=1.0,
+                            color=(100, 255, 160), alpha=0.15,
+                        )
+                        st.image(
+                            cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB),
+                            use_container_width=True,
+                            caption=f"Cosine similarity: {sim_pct:.3f}",
+                        )
+                        _, buf = cv2.imencode(".png", highlighted)
+                        st.download_button(
+                            label="⬇ Download highlighted image",
+                            data=buf.tobytes(),
+                            file_name=f"cnn_match_{rank}_{result.chart_path}",
+                            mime="image/png",
+                            key=f"cnn_dl_{rank}",
+                        )
+
+                    st.divider()
+
+        elif cnn_disabled:
+            if ref_img_bgr is None and not cand_files:
+                st.info("Upload a reference image and candidate charts to begin.")
+            elif ref_img_bgr is None:
+                st.info("Upload a reference image to begin.")
+            else:
+                st.info("Upload candidate charts to search.")
+
+
+
