@@ -30,6 +30,17 @@ from engine import (
     TRADINGVIEW_COLORS,
 )
 
+# Visual matcher — graceful degradation if file is missing
+try:
+    from matcher import (
+        VisualMatchParams,
+        prepare_visual_reference,
+        visual_search_chart,
+    )
+    _MATCHER_OK = True
+except ImportError:
+    _MATCHER_OK = False
+
 # ─────────────────────────────────────────────────────────────────────
 #  PAGE CONFIG
 # ─────────────────────────────────────────────────────────────────────
@@ -81,6 +92,7 @@ st.markdown("""
 with st.sidebar:
     st.title("⚙️ Settings")
 
+    # ── DTW settings ─────────────────────────────────────────────────
     st.subheader("Reference mode")
     ref_mode_label = st.radio(
         "How is the pattern defined?",
@@ -148,7 +160,7 @@ with st.sidebar:
     threshold = st.slider("Minimum similarity", 0.20, 0.95, 0.40, 0.05)
     top_n     = st.slider("Max results", 1, 20, 8)
     stride    = st.select_slider(
-        "Search precision",
+        "Search precision (DTW)",
         options=[2, 5, 10, 20, 40],
         value=10,
         help="Lower = more precise but slower",
@@ -192,7 +204,6 @@ with st.sidebar:
             )
         else:
             fuzz_params = fuzz_preset(fuzz_level)
-            # Show what the master slider resolved to
             st.caption(
                 f"→ Resolution: **{fuzz_params.dtw_resolution}** pts  |  "
                 f"Warp: **{fuzz_params.dtw_band_pct:.0%}**  |  "
@@ -206,6 +217,53 @@ with st.sidebar:
         help="Brightness cutoff for the price line",
     )
 
+    # ── Visual matcher settings ───────────────────────────────────────
+    if _MATCHER_OK:
+        st.subheader("🖼️ Visual matcher")
+        st.caption("Settings for the binarised NCC/SSIM sliding-window engine.")
+
+        vis_n_scales = st.slider(
+            "Scale candidates", 5, 16, 9,
+            help="How many time-stretch ratios to try. More = better coverage, slower.",
+        )
+        vis_scale_min = st.slider(
+            "Min time scale", 0.25, 1.0, 0.5, 0.05,
+            help="Narrowest reference patch relative to original width.",
+        )
+        vis_scale_max = st.slider(
+            "Max time scale", 1.0, 3.0, 2.0, 0.1,
+            help="Widest reference patch relative to original width.",
+        )
+        vis_stride_pct = st.select_slider(
+            "Search precision (Visual)",
+            options=[0.05, 0.10, 0.15, 0.20],
+            value=0.10,
+            format_func=lambda v: f"{v:.0%}",
+            help="Stride as fraction of patch width. Lower = more precise, slower.",
+        )
+        vis_binarise = st.slider(
+            "Binarisation threshold", 20, 180, 60,
+            help="Pixels brighter than this are treated as price content.",
+        )
+        vis_min_window = st.slider(
+            "Min window size", 0.02, 0.20, 0.05, 0.01,
+            help="Minimum match window as a fraction of candidate chart width. "
+                 "Raise this to stop the matcher locking onto tiny slivers.",
+        )
+
+        vis_params = VisualMatchParams(
+            n_scales=vis_n_scales,
+            scale_min=vis_scale_min,
+            scale_max=vis_scale_max,
+            binarise_thresh=vis_binarise,
+            stride_pct=vis_stride_pct,
+            min_window_pct=vis_min_window,
+        )
+    else:
+        vis_params = None
+        st.subheader("🖼️ Visual matcher")
+        st.warning("`matcher.py` not found — Visual tab unavailable.")
+
     st.subheader("TradingView MCP")
     st.info(
         "Connect a TradingView MCP server to auto-populate candidate charts.\n\n"
@@ -214,7 +272,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.caption("Chart Pattern Matcher v1.2")
+    st.caption("Chart Pattern Matcher v1.3")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -225,7 +283,7 @@ st.title("📈 Chart Pattern Matcher")
 st.caption("Upload a reference pattern → drop candidate charts → find visual matches")
 
 # ─────────────────────────────────────────────────────────────────────
-#  REFERENCE UPLOAD
+#  REFERENCE + CANDIDATES  (shared by both engines)
 # ─────────────────────────────────────────────────────────────────────
 
 col_ref, col_cands = st.columns([1, 1], gap="large")
@@ -300,7 +358,6 @@ with col_ref:
         if pattern is not None:
             st.success(f"✓ Pattern extracted — {pattern.length} sample points")
 
-            # Show extracted signals
             chart_data = {"Mid (price shape)": pattern.mid.tolist()}
             if ref_signal == SignalMode.HLC and pattern.spread.max() > 0.01:
                 chart_data["Spread (H-L width)"] = pattern.spread.tolist()
@@ -318,10 +375,6 @@ with col_ref:
     else:
         st.info("👆 Drop your reference chart here")
 
-
-# ─────────────────────────────────────────────────────────────────────
-#  CANDIDATE CHARTS
-# ─────────────────────────────────────────────────────────────────────
 
 with col_cands:
     st.subheader("② Candidate charts")
@@ -379,141 +432,268 @@ if pattern is not None and cand_files:
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  SEARCH
+#  SEARCH BUTTONS
 # ─────────────────────────────────────────────────────────────────────
 
 st.divider()
-run_disabled = (pattern is None) or (not cand_files)
 
-if st.button(
-    "🔍 Search for pattern",
-    disabled=run_disabled,
-    type="primary",
-    use_container_width=True,
-):
-    st.subheader("③ Results")
-    st.caption(
-        f"Fuzziness: **{fuzz_level:.0%}** — "
-        f"Resolution {fuzz_params.dtw_resolution}pt · "
-        f"Warp {fuzz_params.dtw_band_pct:.0%} · "
-        f"Decay {fuzz_params.score_decay:.1f} · "
-        f"Smooth {fuzz_params.smooth_window}px"
+run_disabled = (pattern is None) or (not cand_files)
+vis_disabled = (ref_img_bgr is None) or (not cand_files) or (not _MATCHER_OK)
+
+btn_col1, btn_col2 = st.columns(2)
+
+with btn_col1:
+    run_dtw = st.button(
+        "🔍 Search — DTW engine",
+        disabled=run_disabled,
+        type="primary",
+        use_container_width=True,
     )
 
-    results: list[MatchResult] = []
-    prog = st.progress(0, text="Searching…")
+with btn_col2:
+    run_vis = st.button(
+        "🖼️ Search — Visual engine",
+        disabled=vis_disabled,
+        type="secondary",
+        use_container_width=True,
+        help="Disabled" if not _MATCHER_OK else (
+            "Upload a reference image and candidates to enable"
+            if vis_disabled else "Run binarised NCC/SSIM sliding-window search"
+        ),
+    )
 
-    for i, f in enumerate(cand_files):
-        f.seek(0)
-        img_bgr = image_from_bytes(f.read())
-        prog.progress(i / len(cand_files), text=f"Searching {f.name}…")
 
-        if cand_signal == SignalMode.CANDLE:
-            signals = extract_candlestick(img_bgr)
-        else:
-            signals = extract_price_curve(img_bgr, brightness_threshold=brightness_thresh)
-        if signals is None:
-            continue
+# ─────────────────────────────────────────────────────────────────────
+#  RESULTS — shared render helper
+# ─────────────────────────────────────────────────────────────────────
 
-        sim, sx, ex = search_chart(
-            pattern, signals,
-            stride=stride,
-            signal_mode=match_signal,
-            spread_weight=spread_weight,
-            fuzz=fuzz_params,
-        )
-
-        timestamps = extract_timestamps(img_bgr)
-        start_time = interpolate_time(sx / max(signals.length, 1), timestamps)
-        end_time   = interpolate_time(ex / max(signals.length, 1), timestamps)
-        meta       = parse_filename_metadata(f.name)
-
-        results.append(MatchResult(
-            chart_path=f.name,
-            similarity=sim,
-            match_start_x=sx,
-            match_end_x=ex,
-            curve_len=signals.length,
-            start_time=start_time,
-            end_time=end_time,
-            symbol=meta["symbol"],
-            timeframe=meta["timeframe"],
-        ))
-
-    prog.progress(1.0, text="Done")
-
-    results = sorted(
-        [r for r in results if r.similarity >= threshold],
-        key=lambda r: r.similarity,
-        reverse=True,
-    )[:top_n]
-
+def _render_results(
+    results: list[MatchResult],
+    threshold: float,
+    cand_files,
+    engine_label: str,
+) -> None:
+    """Render a ranked result list.  Shared by both engines."""
     if not results:
         st.warning(
             f"No matches found above {threshold:.0%} similarity. "
             "Try lowering the threshold in the sidebar."
         )
-    else:
-        st.success(f"Found {len(results)} match(es)")
+        return
 
-        for rank, result in enumerate(results, 1):
-            sim_pct = result.similarity
-            colour  = "#00e676" if sim_pct >= 0.6 else "#ff9800"
+    st.success(f"Found {len(results)} match(es) — {engine_label}")
 
-            hcol1, hcol2 = st.columns([3, 1])
-            with hcol1:
-                tags = ""
-                if result.symbol:
-                    tags += f'<span class="meta-tag">{result.symbol}</span>'
-                if result.timeframe:
-                    tags += f'<span class="meta-tag">{result.timeframe}</span>'
-                st.markdown(
-                    f"**#{rank} — {Path(result.chart_path).stem}** &nbsp; {tags}",
-                    unsafe_allow_html=True,
-                )
-            with hcol2:
-                st.markdown(
-                    f'<div style="text-align:right;font-size:1.5rem;'
-                    f'font-weight:bold;color:{colour}">{sim_pct:.1%}</div>',
-                    unsafe_allow_html=True,
-                )
+    for rank, result in enumerate(results, 1):
+        sim_pct = result.similarity
+        colour  = "#00e676" if sim_pct >= 0.6 else "#ff9800"
 
-            st.progress(sim_pct)
+        hcol1, hcol2 = st.columns([3, 1])
+        with hcol1:
+            tags = ""
+            if result.symbol:
+                tags += f'<span class="meta-tag">{result.symbol}</span>'
+            if result.timeframe:
+                tags += f'<span class="meta-tag">{result.timeframe}</span>'
+            st.markdown(
+                f"**#{rank} — {Path(result.chart_path).stem}** &nbsp; {tags}",
+                unsafe_allow_html=True,
+            )
+        with hcol2:
+            st.markdown(
+                f'<div style="text-align:right;font-size:1.5rem;'
+                f'font-weight:bold;color:{colour}">{sim_pct:.1%}</div>',
+                unsafe_allow_html=True,
+            )
 
-            if result.start_time and result.end_time:
-                time_str = (
-                    f'<span class="time-badge">⏱ {result.start_time} → {result.end_time}</span>'
-                )
+        st.progress(sim_pct)
+
+        if result.start_time and result.end_time:
+            time_str = (
+                f'<span class="time-badge">⏱ {result.start_time} → {result.end_time}</span>'
+            )
+        else:
+            time_str = (
+                f'<span class="time-badge">'
+                f'📍 {result.start_pct:.0%} – {result.end_pct:.0%} of chart width'
+                f'</span>'
+            )
+        st.markdown(time_str, unsafe_allow_html=True)
+
+        match_file = next((f for f in cand_files if f.name == result.chart_path), None)
+        if match_file:
+            match_file.seek(0)
+            match_img   = image_from_bytes(match_file.read())
+            highlighted = draw_match_highlight(match_img, result.start_pct, result.end_pct)
+            st.image(
+                cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB),
+                use_container_width=True,
+                caption="Match region highlighted in green",
+            )
+            _, buf = cv2.imencode(".png", highlighted)
+            st.download_button(
+                label="⬇ Download highlighted image",
+                data=buf.tobytes(),
+                file_name=f"match_{rank}_{result.chart_path}",
+                mime="image/png",
+                key=f"dl_{engine_label}_{rank}",
+            )
+
+        st.divider()
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  RUN — DTW ENGINE
+# ─────────────────────────────────────────────────────────────────────
+
+if run_dtw:
+    st.subheader("③ Results")
+
+    tab_dtw, tab_vis = st.tabs(["📉 DTW engine", "🖼️ Visual engine"])
+
+    with tab_dtw:
+        st.caption(
+            f"Fuzziness: **{fuzz_level:.0%}** — "
+            f"Resolution {fuzz_params.dtw_resolution}pt · "
+            f"Warp {fuzz_params.dtw_band_pct:.0%} · "
+            f"Decay {fuzz_params.score_decay:.1f} · "
+            f"Smooth {fuzz_params.smooth_window}px"
+        )
+
+        results: list[MatchResult] = []
+        prog = st.progress(0, text="Searching…")
+
+        for i, f in enumerate(cand_files):
+            f.seek(0)
+            img_bgr = image_from_bytes(f.read())
+            prog.progress(i / len(cand_files), text=f"Searching {f.name}…")
+
+            if cand_signal == SignalMode.CANDLE:
+                signals = extract_candlestick(img_bgr)
             else:
-                time_str = (
-                    f'<span class="time-badge">'
-                    f'📍 {result.start_pct:.0%} – {result.end_pct:.0%} of chart width'
-                    f'</span>'
-                )
-            st.markdown(time_str, unsafe_allow_html=True)
+                signals = extract_price_curve(img_bgr, brightness_threshold=brightness_thresh)
+            if signals is None:
+                continue
 
-            match_file = next((f for f in cand_files if f.name == result.chart_path), None)
-            if match_file:
-                match_file.seek(0)
-                match_img   = image_from_bytes(match_file.read())
-                highlighted = draw_match_highlight(match_img, result.start_pct, result.end_pct)
-                st.image(
-                    cv2.cvtColor(highlighted, cv2.COLOR_BGR2RGB),
-                    use_container_width=True,
-                    caption="Match region highlighted in green",
-                )
-                _, buf = cv2.imencode(".png", highlighted)
-                st.download_button(
-                    label="⬇ Download highlighted image",
-                    data=buf.tobytes(),
-                    file_name=f"match_{rank}_{result.chart_path}",
-                    mime="image/png",
-                    key=f"dl_{rank}",
-                )
+            sim, sx, ex = search_chart(
+                pattern, signals,
+                stride=stride,
+                signal_mode=match_signal,
+                spread_weight=spread_weight,
+                fuzz=fuzz_params,
+            )
 
-            st.divider()
+            timestamps = extract_timestamps(img_bgr)
+            start_time = interpolate_time(sx / max(signals.length, 1), timestamps)
+            end_time   = interpolate_time(ex / max(signals.length, 1), timestamps)
+            meta       = parse_filename_metadata(f.name)
 
-elif run_disabled:
+            results.append(MatchResult(
+                chart_path=f.name,
+                similarity=sim,
+                match_start_x=sx,
+                match_end_x=ex,
+                curve_len=signals.length,
+                start_time=start_time,
+                end_time=end_time,
+                symbol=meta["symbol"],
+                timeframe=meta["timeframe"],
+            ))
+
+        prog.progress(1.0, text="Done")
+
+        results = sorted(
+            [r for r in results if r.similarity >= threshold],
+            key=lambda r: r.similarity,
+            reverse=True,
+        )[:top_n]
+
+        _render_results(results, threshold, cand_files, "DTW")
+
+    with tab_vis:
+        st.info("Click **🖼️ Search — Visual engine** to run the visual matcher.")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  RUN — VISUAL ENGINE
+# ─────────────────────────────────────────────────────────────────────
+
+elif run_vis:
+    st.subheader("③ Results")
+
+    tab_dtw, tab_vis = st.tabs(["📉 DTW engine", "🖼️ Visual engine"])
+
+    with tab_dtw:
+        st.info("Click **🔍 Search — DTW engine** to run the DTW matcher.")
+
+    with tab_vis:
+        ssim_note = "NCC z-score + clustering"
+        st.caption(
+            f"Scoring: **{ssim_note}** · "
+            f"Scales: **{vis_params.n_scales}** "
+            f"({vis_params.scale_min:.1f}× – {vis_params.scale_max:.1f}×) · "
+            f"Stride: **{vis_params.stride_pct:.0%}**"
+        )
+
+        # Prepare reference patch once
+        ref_patch = prepare_visual_reference(ref_img_bgr, vis_params)
+        if ref_patch is None:
+            st.error(
+                "Could not binarise the reference image. "
+                "Try lowering the Binarisation threshold in the sidebar."
+            )
+        else:
+            vis_results: list[MatchResult] = []
+            prog = st.progress(0, text="Searching…")
+
+            for i, f in enumerate(cand_files):
+                f.seek(0)
+                img_bgr = image_from_bytes(f.read())
+                prog.progress(i / len(cand_files), text=f"Searching {f.name}…")
+
+                sim, s_pct, e_pct = visual_search_chart(ref_patch, img_bgr, vis_params)
+
+                # Derive pixel positions from percentages for MatchResult
+                # We need a dummy curve_len; use candidate chart width after crop.
+                h_c, w_c = img_bgr.shape[:2]
+                rc = int(w_c * 0.09)
+                chart_w = w_c - rc
+                sx = int(s_pct * chart_w)
+                ex = int(e_pct * chart_w)
+
+                # Attempt timestamp lookup via the same OCR path
+                timestamps = extract_timestamps(img_bgr)
+                start_time = interpolate_time(s_pct, timestamps)
+                end_time   = interpolate_time(e_pct, timestamps)
+                meta       = parse_filename_metadata(f.name)
+
+                vis_results.append(MatchResult(
+                    chart_path=f.name,
+                    similarity=sim,
+                    match_start_x=sx,
+                    match_end_x=ex,
+                    curve_len=chart_w,
+                    start_time=start_time,
+                    end_time=end_time,
+                    symbol=meta["symbol"],
+                    timeframe=meta["timeframe"],
+                ))
+
+            prog.progress(1.0, text="Done")
+
+            vis_results = sorted(
+                [r for r in vis_results if r.similarity >= threshold],
+                key=lambda r: r.similarity,
+                reverse=True,
+            )[:top_n]
+
+            _render_results(vis_results, threshold, cand_files, "Visual")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  IDLE STATE
+# ─────────────────────────────────────────────────────────────────────
+
+elif run_disabled and not run_vis:
     if pattern is None and not cand_files:
         st.info("Upload a reference image and candidate charts to begin.")
     elif pattern is None:
